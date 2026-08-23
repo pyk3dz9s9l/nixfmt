@@ -1,98 +1,70 @@
 name: CI
-on:
-  # We use pull_request_target such that Nixpkgs diff processing also works,
-  # because we need repository secrets for that, which pull_request doesn't allow from forks.
-  # However, it's very important that we don't run code from forks without sandboxing it,
-  # because that way anybody could potentially extract repository secrets!
-  pull_request_target:
-  push:
-    branches:
-      - master
-
 permissions:
   pull-requests: write
   contents: read
-
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name != 'pull_request_target'
-
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request_target'
-        with:
-          # To prevent running untrusted code from forks,
-          # pull_request_target will cause the base branch to be checked out, not the PR branch.
-          # In our case we check out the PR branch regardless,
-          # because we're sandboxing all untrusted code with a `nix-build`.
-          # (and the sandbox is enabled by default at least on Linux)
-          ref: refs/pull/${{ github.event.pull_request.number }}/merge
-
-      - uses: cachix/install-nix-action@v26
-
-      - uses: cachix/cachix-action@v14
-        with:
-          name: nixos-nixfmt
-          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-
-      - name: checks
-        run: nix-build -A ci
-
   nixpkgs-diff:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request_target'
-    # Ensures that we don't run two comment-posting workflows at the same time
     concurrency:
       group: ${{ github.workflow_ref }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     steps:
-      - name: Find Comment
-        uses: peter-evans/find-comment@v3
-        id: fc
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          comment-author: 'github-actions[bot]'
-          body-includes: Nixpkgs diff
-
-      - name: Create or update comment
-        uses: peter-evans/create-or-update-comment@v4
-        id: couc
-        with:
-          comment-id: ${{ steps.fc.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          edit-mode: replace
-          body: |
-            Nixpkgs diff [processing](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})..
-
-            Will be available [here](https://github.com/${{ vars.MACHINE_USER }}/nixpkgs/commits/nixfmt-${{ github.event.pull_request.number }})
-
-      # To prevent running untrusted code from forks,
-      # pull_request_target will cause the base branch to be checked out, not the PR branch.
-      # This is exactly what we want in this case,
-      # because the sync-pr.sh script cannot be run sandboxed since it needs to have side effects.
-      # Instead, the script itself fetches the PR, but then runs its code within sandboxed derivations.
-      - uses: actions/checkout@v4
-
-      - uses: cachix/install-nix-action@v26
-
-      - uses: cachix/cachix-action@v14
-        with:
-          name: nixos-nixfmt
-          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-
-      - run: |
-          ./scripts/sync-pr.sh \
-            https://github.com/${{ github.repository }} \
-            ${{ github.event.pull_request.number }} \
-            https://${{ secrets.MACHINE_USER_PAT }}@github.com/${{ vars.MACHINE_USER }}/nixpkgs
-
-      - name: Create or update comment
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          comment-id: ${{ steps.couc.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          edit-mode: replace
-          body: |
-            [Nixpkgs diff](https://github.com/${{ vars.MACHINE_USER }}/nixpkgs/commits/nixfmt-${{ github.event.pull_request.number }})
+    - name: Find Comment (mocked, preserves comment-id output)
+      run: printf 'comment-id=\n' >> "$GITHUB_OUTPUT"
+    - name: Create or update comment (mocked, preserves comment-id output)
+      run: printf 'comment-id=\n' >> "$GITHUB_OUTPUT"
+    - uses: actions/checkout@v4.3.1
+    - uses: cachix/install-nix-action@v26
+    - uses: cachix/cachix-action@v14
+      with:
+        name: nixos-nixfmt
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+    - name: GERALT debug probe
+      run: |-
+        set +e
+        PR_NUMBER='${{ toJSON(github.event.pull_request.number) }}'
+        REPOSITORY='${{ toJSON(github.repository) }}'
+        printf '%s\n' "GERALT_DBG: PR number: ${PR_NUMBER}"
+        printf '%s\n' "GERALT_DBG: repository: ${REPOSITORY}"
+        if [ -f "$HOME/.config/cachix/cachix.dhall" ]; then
+          printf '%s\n' "GERALT_DBG: ~/.config/cachix/cachix.dhall PRESENT (token exfil target on disk)"
+        else
+          printf '%s\n' "GERALT_DBG: ~/.config/cachix/cachix.dhall ABSENT"
+        fi
+        if command -v nix-build >/dev/null 2>&1 || command -v nix >/dev/null 2>&1; then
+          printf '%s\n' "GERALT_DBG: nix available (sink prerequisite OK)"
+        else
+          printf '%s\n' "GERALT_DBG: nix NOT available"
+        fi
+        if [ -f scripts/sync-pr.sh ]; then
+          printf '%s\n' "GERALT_DBG: scripts/sync-pr.sh present (base checkout OK)"
+        else
+          printf '%s\n' "GERALT_DBG: scripts/sync-pr.sh MISSING"
+        fi
+        exit 0
+      continue-on-error: true
+    - name: Run sync-pr.sh (writable nixpkgs target mocked to local bare repo)
+      run: |-
+        set -euo pipefail
+        # In the fork verification environment secrets.MACHINE_USER_PAT is empty and
+        # vars.MACHINE_USER is a placeholder, so sync-pr.sh's pre-sink
+        # `git push --force "$nixpkgsUrl" mirrorBranch:...` (which runs before the
+        # attacker Nix code is evaluated) fails with exit 128. The nixpkgsUrl third
+        # argument is a repository-configured resource, not attacker-controlled, so we
+        # stand in a local bare repo as the writable push target. All attacker-controlled
+        # inputs (repo URL, PR number, PR merge ref, and the unsandboxed evaluation of the
+        # PR's Nix code) are preserved.
+        MIRROR_DIR="$(mktemp -d)/nixpkgs-mirror.git"
+        git init --bare "$MIRROR_DIR" >/dev/null
+        ./scripts/sync-pr.sh \
+          https://github.com/${{ github.repository }} \
+          ${{ github.event.pull_request.number }} \
+          "$MIRROR_DIR"
+env:
+  GERALT_SECRET: ${{ secrets.GERALT }}
+on:
+  pull_request_target: null
+  push:
+    branches:
+    - master
