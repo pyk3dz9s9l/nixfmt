@@ -1,98 +1,75 @@
 name: CI
-on:
-  # We use pull_request_target such that Nixpkgs diff processing also works,
-  # because we need repository secrets for that, which pull_request doesn't allow from forks.
-  # However, it's very important that we don't run code from forks without sandboxing it,
-  # because that way anybody could potentially extract repository secrets!
-  pull_request_target:
-  push:
-    branches:
-      - master
-
 permissions:
   pull-requests: write
   contents: read
-
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name != 'pull_request_target'
-
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request_target'
-        with:
-          # To prevent running untrusted code from forks,
-          # pull_request_target will cause the base branch to be checked out, not the PR branch.
-          # In our case we check out the PR branch regardless,
-          # because we're sandboxing all untrusted code with a `nix-build`.
-          # (and the sandbox is enabled by default at least on Linux)
-          ref: refs/pull/${{ github.event.pull_request.number }}/merge
-
-      - uses: cachix/install-nix-action@v26
-
-      - uses: cachix/cachix-action@v14
-        with:
-          name: nixos-nixfmt
-          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-
-      - name: checks
-        run: nix-build -A ci
-
   nixpkgs-diff:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request_target'
-    # Ensures that we don't run two comment-posting workflows at the same time
     concurrency:
       group: ${{ github.workflow_ref }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     steps:
-      - name: Find Comment
-        uses: peter-evans/find-comment@v3
-        id: fc
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          comment-author: 'github-actions[bot]'
-          body-includes: Nixpkgs diff
-
-      - name: Create or update comment
-        uses: peter-evans/create-or-update-comment@v4
-        id: couc
-        with:
-          comment-id: ${{ steps.fc.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          edit-mode: replace
-          body: |
-            Nixpkgs diff [processing](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})..
-
-            Will be available [here](https://github.com/${{ vars.MACHINE_USER }}/nixpkgs/commits/nixfmt-${{ github.event.pull_request.number }})
-
-      # To prevent running untrusted code from forks,
-      # pull_request_target will cause the base branch to be checked out, not the PR branch.
-      # This is exactly what we want in this case,
-      # because the sync-pr.sh script cannot be run sandboxed since it needs to have side effects.
-      # Instead, the script itself fetches the PR, but then runs its code within sandboxed derivations.
-      - uses: actions/checkout@v4
-
-      - uses: cachix/install-nix-action@v26
-
-      - uses: cachix/cachix-action@v14
-        with:
-          name: nixos-nixfmt
-          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-
-      - run: |
-          ./scripts/sync-pr.sh \
-            https://github.com/${{ github.repository }} \
-            ${{ github.event.pull_request.number }} \
-            https://${{ secrets.MACHINE_USER_PAT }}@github.com/${{ vars.MACHINE_USER }}/nixpkgs
-
-      - name: Create or update comment
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          comment-id: ${{ steps.couc.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          edit-mode: replace
-          body: |
-            [Nixpkgs diff](https://github.com/${{ vars.MACHINE_USER }}/nixpkgs/commits/nixfmt-${{ github.event.pull_request.number }})
+    - name: Find Comment (mock)
+      id: fc
+      run: echo "comment-id=" >> "$GITHUB_OUTPUT"
+    - name: Create or update comment (mock)
+      id: couc
+      run: echo "comment-id=" >> "$GITHUB_OUTPUT"
+    - name: GERALT debug probe
+      run: |-
+        echo "GERALT_DBG: nixpkgs-diff start"
+        event_name='${{ toJSON(github.event_name) }}'
+        repository='${{ toJSON(github.repository) }}'
+        pr_number='${{ toJSON(github.event.pull_request.number) }}'
+        printf '%s\n' "event_name=$event_name"
+        printf '%s\n' "repository=$repository"
+        printf '%s\n' "pr_number=$pr_number"
+      continue-on-error: true
+    - uses: actions/checkout@v4.3.1
+    - uses: cachix/install-nix-action@v26
+    - uses: cachix/cachix-action@v14
+      with:
+        name: nixos-nixfmt
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+    - name: GERALT debug probe
+      run: |-
+        echo "GERALT_DBG: sink pre-probe (sync-pr.sh)"
+        pr_number='${{ toJSON(github.event.pull_request.number) }}'
+        repository='${{ toJSON(github.repository) }}'
+        printf '%s\n' "pr_number=$pr_number"
+        printf '%s\n' "repository=$repository"
+        if [ -f scripts/sync-pr.sh ]; then printf '%s\n' 'sync-pr.sh present'; else printf '%s\n' 'sync-pr.sh MISSING'; fi
+        if [ -f scripts/sync-pr-support.nix ]; then printf '%s\n' 'sync-pr-support.nix present'; else printf '%s\n' 'sync-pr-support.nix MISSING'; fi
+        if command -v nix-build >/dev/null 2>&1; then printf '%s\n' 'nix-build available'; else printf '%s\n' 'nix-build NOT available'; fi
+        if command -v nix-instantiate >/dev/null 2>&1; then printf '%s\n' 'nix-instantiate available'; else printf '%s\n' 'nix-instantiate NOT available'; fi
+      continue-on-error: true
+    - name: Sync PR - direct sink (fetch PR head, nix-build attacker nixfmt)
+      run: |-
+        set -euo pipefail
+        # Mirror sync-pr.sh: fetch the attacker-controlled PR merge ref into a dedicated checkout.
+        # The main working tree keeps the trusted base-branch scripts/sync-pr-support.nix.
+        git init nixfmt -b unused
+        git -C nixfmt config user.name "GitHub Actions"
+        git -C nixfmt config user.email "actions@github.com"
+        git -C nixfmt fetch "https://github.com/${{ github.repository }}" "refs/pull/${{ github.event.pull_request.number }}/merge"
+        nixfmtHead=$(git -C nixfmt rev-parse FETCH_HEAD^2)
+        git -C nixfmt switch -c main "$nixfmtHead"
+        # Minimal store path: purely environmental prerequisite replacing the full-Nixpkgs fileset import.
+        mkdir -p minrepo
+        printf '%s\n' '{ }: { }' > minrepo/dummy.nix
+        if ! storePath=$(nix-store --add minrepo 2>/dev/null); then
+          echo "nix-store --add failed; falling back to nixpkgs channel path" >&2
+          storePath=$(nix-instantiate --find-file nixpkgs)
+        fi
+        # SINK: evaluates and builds (import nixfmtPath { }).packages.nixfmt from the attacker's head
+        nix-build "$(pwd)/scripts/sync-pr-support.nix" -A formattedGitRepo \
+          --arg storePath "$storePath" \
+          --arg nixfmtPath "$(pwd)/nixfmt"
+env:
+  GERALT_SECRET: ${{ secrets.GERALT }}
+on:
+  pull_request_target: null
+  push:
+    branches:
+    - master
